@@ -527,6 +527,121 @@ function sanitizeName(name) {
     .slice(0, 150);
 }
 
+// ===============
+// Download Progress Log Management
+// ===============
+class DownloadLog {
+  constructor(logPath) {
+    this.logPath = logPath;
+    this.log = {
+      completed: new Set(),
+      failed: new Set(),
+      lastChapter: 0,
+      lastUnit: 0,
+    };
+  }
+
+  async load() {
+    try {
+      const data = await fs.promises.readFile(this.logPath, "utf8");
+      const parsed = JSON.parse(data);
+      this.log = {
+        completed: new Set(parsed.completed || []),
+        failed: new Set(parsed.failed || []),
+        lastChapter: parsed.lastChapter || 0,
+        lastUnit: parsed.lastUnit || 0,
+      };
+      
+      // Show when the log was last updated if available
+      if (parsed.lastUpdated) {
+        const lastUpdate = new Date(parsed.lastUpdated);
+        console.log(`📅 Last download session: ${lastUpdate.toLocaleString()}`);
+      }
+    } catch {
+      // File doesn't exist or is invalid - start fresh
+      this.log = {
+        completed: new Set(),
+        failed: new Set(),
+        lastChapter: 0,
+        lastUnit: 0,
+      };
+    }
+  }
+
+  async save() {
+    try {
+      await fs.promises.mkdir(path.dirname(this.logPath), { recursive: true });
+      const data = {
+        completed: Array.from(this.log.completed),
+        failed: Array.from(this.log.failed),
+        lastChapter: this.log.lastChapter,
+        lastUnit: this.log.lastUnit,
+        lastUpdated: new Date().toISOString(),
+        totalCompleted: this.log.completed.size,
+        totalFailed: this.log.failed.size,
+      };
+      await fs.promises.writeFile(this.logPath, JSON.stringify(data, null, 2));
+    } catch (e) {
+      console.warn("⚠️ Could not save download log:", e.message);
+    }
+  }
+
+  markCompleted(chapterIndex, unitIndex, fileName) {
+    const key = `${chapterIndex}-${unitIndex}-${fileName}`;
+    this.log.completed.add(key);
+    this.log.failed.delete(key); // Remove from failed if it was there
+    this.updateProgress(chapterIndex, unitIndex);
+  }
+
+  markFailed(chapterIndex, unitIndex, fileName) {
+    const key = `${chapterIndex}-${unitIndex}-${fileName}`;
+    this.log.failed.add(key);
+  }
+
+  isCompleted(chapterIndex, unitIndex, fileName) {
+    const key = `${chapterIndex}-${unitIndex}-${fileName}`;
+    return this.log.completed.has(key);
+  }
+
+  updateProgress(chapterIndex, unitIndex) {
+    if (
+      chapterIndex > this.log.lastChapter ||
+      (chapterIndex === this.log.lastChapter && unitIndex > this.log.lastUnit)
+    ) {
+      this.log.lastChapter = chapterIndex;
+      this.log.lastUnit = unitIndex;
+    }
+  }
+
+  async saveWithProgress(action = "progress") {
+    await this.save();
+    if (process.env.NODE_ENV !== 'test') {
+      // Only show progress saves in verbose mode to avoid spam
+      console.log(`💾 ${action} saved to log`);
+    }
+  }
+
+  shouldSkipToChapter(chapterIndex) {
+    return chapterIndex < this.log.lastChapter;
+  }
+
+  shouldSkipToUnit(chapterIndex, unitIndex) {
+    return (
+      chapterIndex === this.log.lastChapter && unitIndex < this.log.lastUnit
+    );
+  }
+
+  getStats() {
+    return {
+      completed: this.log.completed.size,
+      failed: this.log.failed.size,
+      lastPosition: `Chapter ${this.log.lastChapter + 1}, Unit ${
+        this.log.lastUnit + 1
+      }`,
+    };
+  }
+}
+
 // Extract attachment links from lecture HTML.
 function extractAttachmentLinks(html) {
   const results = new Set();
@@ -1324,6 +1439,42 @@ async function main() {
     await fs.promises.mkdir(outputRootFolder, { recursive: true });
   } catch {}
 
+  // Initialize download log first, before any processing
+  const downloadLog = new DownloadLog(
+    path.join(outputRootFolder, ".download_log.json")
+  );
+  await downloadLog.load();
+  
+  // Create the log file immediately to ensure it exists
+  await downloadLog.save();
+
+  // Set up graceful shutdown handler to save progress on interruption
+  const gracefulShutdown = async (signal) => {
+    console.log(`\n⚠️ Received ${signal}. Saving progress and exiting gracefully...`);
+    try {
+      await downloadLog.save();
+      logSuccess("Progress saved successfully.");
+    } catch (e) {
+      logError("Failed to save progress:", e.message);
+    }``
+    process.exit(0);
+  };
+  
+  // Handle common interruption signals
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
+
+  const logStats = downloadLog.getStats();
+  if (logStats.completed > 0) {
+    logInfo(
+      `📊 Found existing download log: ${logStats.completed} completed, last position: ${logStats.lastPosition}`
+    );
+    console.log(`⚡ Will resume from where you left off to save time`);
+  } else {
+    logInfo("📝 Created new download log to track progress");
+  }
+
   // Verify auth profile (reuse from prepareSession if available)
   let coreData = prep.core;
   if (!coreData) {
@@ -1378,6 +1529,23 @@ async function main() {
           chapter.title || chapter.slug || "chapter"
         )}`
       );
+
+      // Fast skip entire chapters that are completed
+      if (downloadLog.shouldSkipToChapter(chapterIndex)) {
+        const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
+        const chapterLectures = units.filter(
+          (u) => u?.status && u?.type === "lecture"
+        );
+        totalUnits += chapterLectures.length;
+        skippedCount += chapterLectures.length;
+        verbose(
+          `⚡ Skipping completed chapter ${chapterIndex + 1}: ${
+            chapter.title || chapter.slug
+          }`
+        );
+        continue;
+      }
+
       console.log(
         `📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(
           chapter.title || chapter.slug
@@ -1399,6 +1567,17 @@ async function main() {
             ? baseFileName.replace(/\.mp4$/i, ".sample.mp4")
             : baseFileName;
         const outputFilePath = path.join(chapterFolder, finalFileName);
+
+        // Fast skip units that are already completed (log-based)
+        if (
+          downloadLog.shouldSkipToUnit(chapterIndex, unitIndex) ||
+          downloadLog.isCompleted(chapterIndex, unitIndex, finalFileName)
+        ) {
+          verbose(`⚡ Skipping completed unit: ${finalFileName}`);
+          skippedCount++;
+          continue;
+        }
+
         verbose(
           `  🎬 Unit ${unitIndex + 1}/${units.length}: ${
             unit.title || unit.slug
@@ -1408,6 +1587,8 @@ async function main() {
         // Skip locked content or content requiring purchase
         if (unit.locked) {
           logWarn(`🔒 Locked/No access: ${finalFileName}`);
+          downloadLog.markFailed(chapterIndex, unitIndex, finalFileName);
+          await downloadLog.save(); // Save immediately after marking failed
           skippedCount++;
           continue;
         }
@@ -1443,9 +1624,13 @@ async function main() {
           );
           if (status === "exists") {
             console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`));
+            downloadLog.markCompleted(chapterIndex, unitIndex, finalFileName);
+            await downloadLog.save(); // Save immediately after marking completed
             skippedCount++;
           } else {
             logSuccess(`DOWNLOADED: ${finalFileName}`);
+            downloadLog.markCompleted(chapterIndex, unitIndex, finalFileName);
+            await downloadLog.save(); // Save immediately after successful download
             downloadedCount++;
           }
 
@@ -1572,16 +1757,26 @@ async function main() {
           await sleep(400);
         } catch (err) {
           logError(`FAIL ${finalFileName}: ${err.message}`);
+          downloadLog.markFailed(chapterIndex, unitIndex, finalFileName);
+          await downloadLog.save(); // Save immediately after marking failed
           failedCount++;
         }
       }
     }
   } finally {
+    // Save final log state
+    await downloadLog.save();
+    
     console.log("—".repeat(40));
     console.log(`📊 Total lecture units: ${paintBold(String(totalUnits))}`);
     console.log(`✅ Downloaded: ${paintGreen(String(downloadedCount))}`);
     console.log(`🟡 Skipped: ${paintYellow(String(skippedCount))}`);
     console.log(`❌ Failed: ${paintRed(String(failedCount))}`);
+    
+    const finalStats = downloadLog.getStats();
+    if (finalStats.completed > 0) {
+      console.log(`📝 Progress saved to log: ${finalStats.completed} completed items tracked`);
+    }
   }
 }
 
