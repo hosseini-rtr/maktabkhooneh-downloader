@@ -16,6 +16,8 @@ pnpm-lock.yaml
 # OS
 .DS_Store
 Thumbs.db
+#Mac os index files
+._* 
 
 # Output
 download/
@@ -24,7 +26,6 @@ download/
 .history/
 docs/
 backup/
-New Text Document.txt
 signup/
 session.json
 
